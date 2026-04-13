@@ -72,8 +72,8 @@ try:
     stock_rows, hv_cache, iv_cache = [], {}, {}
 
     for t in tickers:
-        info = fetch_stock_info(t)
-        assert info is not None, f"{t}: fetch_stock_info returned None"
+        info, warn = fetch_stock_info(t)
+        assert info is not None, f"{t}: fetch_stock_info returned None (warn={warn})"
         assert info["price"] is not None and info["price"] > 0, f"{t}: price is {info['price']}"
         stock_rows.append(info)
         prices = fetch_historical_prices(t)
@@ -84,11 +84,11 @@ try:
             iv_cache[t] = iv_hist
 
     stock_df = pd.DataFrame(stock_rows)
-    options_df = fetch_all_options(tickers, min_dte=14, max_dte=60, max_workers=3)
+    options_df, _ = fetch_all_options(tickers, min_dte=14, max_dte=60, max_workers=3)
     assert not options_df.empty, "Options DataFrame is empty"
 
     sector_iv = fetch_sector_iv()
-    enriched = enrich_options(options_df, stock_df, hv_cache, iv_cache, sector_iv, risk_free=4.5)
+    enriched, _ = enrich_options(options_df, stock_df, hv_cache, iv_cache, sector_iv, risk_free=4.5)
 
     assert not enriched.empty, "Enriched DataFrame is empty"
     assert len(enriched[enriched["option_type"] == "put"]) > 0, "No puts in enriched"
@@ -180,8 +180,8 @@ try:
     print(f"  Market open: {is_market_open()}")
 
     for ticker in ["AAPL", "TSLA", "NVDA"]:
-        info = fetch_stock_info(ticker)
-        assert info is not None, f"{ticker}: fetch_stock_info returned None"
+        info, warn = fetch_stock_info(ticker)
+        assert info is not None, f"{ticker}: fetch_stock_info returned None (warn={warn})"
         assert info["price"] is not None and info["price"] > 0, f"{ticker}: price is {info['price']}"
         print(f"  {ticker}: ${info['price']:.2f} — OK")
 
@@ -191,12 +191,102 @@ except Exception as e:
 
 
 # =========================================================================
+# 4H: Partial Stock Info Failure
+# =========================================================================
+print("\n=== 4H: Partial Stock Info Failure ===")
+try:
+    from data_fetcher import fetch_all_stock_info as _fasi
+    tickers_mixed = ["AAPL", "ZZZZZ_FAKE1", "TSLA", "XXXXX_FAKE2", "NVDA", "YYYYY_FAKE3"]
+    result_df, warn_list = _fasi(tickers_mixed, max_workers=4)
+    assert not result_df.empty, "DataFrame should not be empty when some tickers succeed"
+    assert len(result_df) >= 3, f"Expected at least 3 valid tickers, got {len(result_df)}"
+    assert len(warn_list) >= 3, f"Expected at least 3 warnings for fake tickers, got {len(warn_list)}"
+    report("4H", True, f"{len(result_df)} tickers loaded, {len(warn_list)} warnings")
+except Exception as e:
+    report("4H", False, str(e))
+
+
+# =========================================================================
+# 4I: Partial Options Failure
+# =========================================================================
+print("\n=== 4I: Partial Options Failure ===")
+try:
+    from data_fetcher import fetch_all_options as _fao
+    tickers_mixed = ["AAPL", "ZZZZZ_FAKE1", "TSLA"]
+    result_df, warn_list = _fao(tickers_mixed, max_workers=3)
+    assert not result_df.empty, "DataFrame should not be empty when some tickers succeed"
+    assert len(warn_list) >= 1, "Expected at least 1 warning for fake ticker"
+    report("4I", True, f"{len(result_df)} option rows, {len(warn_list)} warnings")
+except Exception as e:
+    report("4I", False, str(e))
+
+
+# =========================================================================
+# 4J: Enrichment Row Fault Isolation
+# =========================================================================
+print("\n=== 4J: Enrichment Row Fault Isolation ===")
+try:
+    from calculations import enrich_options as _eo
+
+    # Create options with one intentionally problematic row (strike=0)
+    good_data = {
+        "ticker": ["AAPL", "AAPL"], "strike": [250.0, 0.0],
+        "bid": [3.0, 0.0], "ask": [3.5, 0.0], "impliedVolatility": [0.25, 0.0],
+        "volume": [100, 0], "openInterest": [500, 0],
+        "expiry": ["2026-05-15", "2026-05-15"], "dte": [30, 30],
+        "option_type": ["put", "put"], "source": ["test", "test"],
+        "fetched_at": ["2026-04-13", "2026-04-13"],
+    }
+    opts_df = pd.DataFrame(good_data)
+    stock_df = pd.DataFrame([{
+        "ticker": "AAPL", "price": 260.0, "market_cap": 3e12, "sector": "Technology",
+        "dividend_yield": 0.005, "ex_div_date": None, "earnings_date": None,
+        "fifty_two_week_high": 280, "fifty_two_week_low": 160,
+        "avg_volume": 50000000, "short_pct_float": 0.01,
+    }])
+
+    result_df, warn_list = _eo(opts_df, stock_df, {}, {}, {}, risk_free=4.5)
+    # The good row should survive even if the bad row is filtered out
+    assert len(result_df) >= 1, f"Expected at least 1 enriched row, got {len(result_df)}"
+    report("4J", True, f"{len(result_df)} rows enriched, {len(warn_list)} warnings")
+except Exception as e:
+    report("4J", False, str(e))
+
+
+# =========================================================================
+# 4K: Full Pipeline Graceful Degradation
+# =========================================================================
+print("\n=== 4K: Full Pipeline Graceful Degradation ===")
+try:
+    from data_fetcher import fetch_all_stock_info as _fasi2, fetch_all_options as _fao2
+    from calculations import compute_all_hv as _cahv, enrich_options as _eo2
+
+    tickers = ["AAPL", "FAKE_TICKER_1", "TSLA", "FAKE_TICKER_2", "NVDA"]
+    stock_df, stock_w = _fasi2(tickers, max_workers=4)
+    assert not stock_df.empty, "stock_df should not be empty"
+
+    valid = stock_df["ticker"].tolist()
+    options_df, opt_w = _fao2(valid, max_workers=3)
+    assert not options_df.empty, "options_df should not be empty"
+
+    enriched, enrich_w = _eo2(options_df, stock_df, {}, {}, {})
+    assert not enriched.empty, "enriched should not be empty"
+
+    total_w = stock_w + opt_w + enrich_w
+    report("4K", True, f"{len(enriched)} rows, {len(total_w)} total warnings")
+    for w in total_w[:5]:
+        print(f"    {w}")
+except Exception as e:
+    report("4K", False, str(e))
+
+
+# =========================================================================
 # 4G: Summary Gate
 # =========================================================================
 print("\n" + "=" * 40)
 print("=== TEST SUMMARY ===")
 print("=" * 40)
-for test_id in ["4A", "4B", "4C", "4D", "4E", "4F"]:
+for test_id in ["4A", "4B", "4C", "4D", "4E", "4F", "4H", "4I", "4J", "4K"]:
     status = "PASS" if results.get(test_id, False) else "FAIL"
     print(f"  {test_id}: {status}")
 

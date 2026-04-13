@@ -205,7 +205,8 @@ section[data-testid="stSidebar"] { display: none !important; }
 # Session state init
 # ---------------------------------------------------------------------------
 for key in ["data_loaded", "enriched_puts", "enriched_calls", "vol_scanner",
-            "vix_data", "risk_free", "sector_iv", "stock_info", "last_refresh"]:
+            "vix_data", "risk_free", "sector_iv", "stock_info", "last_refresh",
+            "refresh_warnings", "data_completeness"]:
     if key not in st.session_state:
         st.session_state[key] = None
 
@@ -253,7 +254,8 @@ def _restore_from_cache() -> bool:
     if data is None:
         return False
     for key in ["enriched_puts", "enriched_calls", "vol_scanner",
-                "vix_data", "risk_free", "sector_iv", "stock_info", "last_refresh"]:
+                "vix_data", "risk_free", "sector_iv", "stock_info", "last_refresh",
+                "data_completeness", "refresh_warnings"]:
         if key in data:
             st.session_state[key] = data[key]
     st.session_state.data_loaded = True
@@ -266,8 +268,10 @@ def _restore_from_cache() -> bool:
 
 def run_full_refresh():
     """Execute the full data fetch and enrichment pipeline.
-    Works during market hours (live data) and after hours (last close data)."""
+    Graceful degradation: always shows the best data available, even if partial.
+    Never returns nothing when some data is available."""
     st.session_state.refresh_running = True
+    all_warnings: list[str] = []
 
     progress = st.progress(0, text="Starting data refresh...")
     status = st.empty()
@@ -279,6 +283,7 @@ def run_full_refresh():
     # --- Step 1: Build universe ---
     progress.progress(2, text="Building ticker universe...")
     tickers = build_universe()
+    total_universe = len(tickers)
 
     # --- Step 2: Fetch VIX & risk-free rates & sector IV ---
     progress.progress(5, text="Fetching VIX, Treasury rates, sector IV...")
@@ -287,22 +292,30 @@ def run_full_refresh():
     sector_iv_data = fetch_sector_iv()
 
     rf_rate = risk_free_data.get("3mo") or risk_free_data.get("1mo") or 4.5
+    if not risk_free_data.get("3mo") and not risk_free_data.get("1mo"):
+        all_warnings.append("Treasury rates unavailable — using default 4.5%")
 
     st.session_state.vix_data = vix_data
     st.session_state.risk_free = risk_free_data
     st.session_state.sector_iv = sector_iv_data
 
-    # --- Step 3: Fetch stock info ---
+    # --- Step 3: Fetch stock info (with per-ticker warnings) ---
     def stock_progress(done, total, ticker):
         pct = 5 + int(done / total * 30)
         progress.progress(pct, text=f"Fetching stock info: {ticker} ({done}/{total})")
 
-    stock_info = fetch_all_stock_info(tickers, max_workers=20, progress_callback=stock_progress)
+    stock_info, stock_warnings = fetch_all_stock_info(tickers, max_workers=20, progress_callback=stock_progress)
+    all_warnings.extend(stock_warnings)
     st.session_state.stock_info = stock_info
 
     if stock_info.empty:
-        st.error("Failed to fetch any stock data. Check your internet connection.")
+        all_warnings.append("CRITICAL: Could not fetch any stock data")
+        st.session_state.refresh_warnings = all_warnings
         st.session_state.refresh_running = False
+        # Fall back to cached data if available
+        if st.session_state.enriched_puts is not None:
+            return
+        st.error("No stock data available and no cached data. Check internet connection.")
         return
 
     valid_tickers = stock_info["ticker"].tolist()
@@ -314,37 +327,50 @@ def run_full_refresh():
     for i, ticker in enumerate(valid_tickers):
         pct = 35 + int(i / total_t * 20)
         progress.progress(pct, text=f"Computing HV: {ticker} ({i+1}/{total_t})")
-        prices = fetch_historical_prices(ticker)
-        if prices is not None:
-            hv_cache[ticker] = compute_all_hv(prices)
-        iv_hist = estimate_iv_history(ticker)
-        if iv_hist is not None:
-            iv_history_cache[ticker] = iv_hist
+        try:
+            prices = fetch_historical_prices(ticker)
+            if prices is not None:
+                hv_cache[ticker] = compute_all_hv(prices)
+            iv_hist = estimate_iv_history(ticker)
+            if iv_hist is not None:
+                iv_history_cache[ticker] = iv_hist
+        except Exception as e:
+            all_warnings.append(f"{ticker}: HV/IV history failed: {e}")
 
-    # --- Step 5: Fetch options chains ---
+    # --- Step 5: Fetch options chains (with per-ticker warnings) ---
     def opts_progress(done, total, ticker):
         pct = 55 + int(done / total * 35)
         progress.progress(pct, text=f"Fetching options: {ticker} ({done}/{total})")
 
-    options_df = fetch_all_options(valid_tickers, min_dte=7, max_dte=90,
-                                    max_workers=10, progress_callback=opts_progress)
+    options_df, opt_warnings = fetch_all_options(valid_tickers, min_dte=7, max_dte=90,
+                                                  max_workers=10, progress_callback=opts_progress)
+    all_warnings.extend(opt_warnings)
 
     if options_df.empty:
-        st.error("No options data retrieved. Try again in a few minutes.")
+        all_warnings.append("CRITICAL: No options chains retrieved")
+        st.session_state.refresh_warnings = all_warnings
         st.session_state.refresh_running = False
+        if st.session_state.enriched_puts is not None:
+            return  # keep showing stale data
+        st.error("No options data available. Please try again later.")
         return
 
-    # --- Step 6: Enrich & Score ---
+    # --- Step 6: Enrich & Score (with per-row fault isolation) ---
     progress.progress(92, text="Calculating metrics & scoring...")
 
-    enriched = enrich_options(
+    enriched, enrich_warnings = enrich_options(
         options_df, stock_info, hv_cache, iv_history_cache,
         sector_iv_data, risk_free=rf_rate,
     )
+    all_warnings.extend(enrich_warnings)
 
     if enriched.empty:
-        st.error("No valid options found after enrichment.")
+        all_warnings.append("CRITICAL: Enrichment produced no valid rows")
+        st.session_state.refresh_warnings = all_warnings
         st.session_state.refresh_running = False
+        if st.session_state.enriched_puts is not None:
+            return
+        st.error("No valid options found after scoring. Please try again later.")
         return
 
     # Split into puts and calls
@@ -371,11 +397,22 @@ def run_full_refresh():
         })
     st.session_state.vol_scanner = pd.DataFrame(vol_data)
 
+    # Data completeness
+    loaded_options_tickers = enriched["ticker"].nunique()
+    completeness = loaded_options_tickers / total_universe * 100 if total_universe > 0 else 0
+    st.session_state.data_completeness = {
+        "total": total_universe,
+        "loaded_stocks": len(stock_info),
+        "loaded_options": loaded_options_tickers,
+        "pct": round(completeness, 1),
+    }
+
     st.session_state.last_refresh = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     st.session_state.data_loaded = True
     st.session_state.refresh_running = False
+    st.session_state.refresh_warnings = all_warnings
 
-    # Persist to disk so data survives Render cold starts
+    # Persist to disk — even partial data is better than nothing on cold start
     _save_cache({
         "enriched_puts": st.session_state.enriched_puts,
         "enriched_calls": st.session_state.enriched_calls,
@@ -385,6 +422,8 @@ def run_full_refresh():
         "sector_iv": st.session_state.sector_iv,
         "stock_info": st.session_state.stock_info,
         "last_refresh": st.session_state.last_refresh,
+        "data_completeness": st.session_state.data_completeness,
+        "refresh_warnings": st.session_state.refresh_warnings,
     })
 
     progress.progress(100, text="Done!")
@@ -818,6 +857,26 @@ def main():
             st.metric("1Y Rate", f"{rf['1yr']:.2f}%", help=f"Source: {rf.get('source','')}")
         else:
             st.metric("1Y Rate", "—")
+
+    # --- Data completeness indicator ---
+    dc = st.session_state.data_completeness
+    if dc:
+        pct = dc["pct"]
+        if pct >= 90:
+            st.success(f"Data loaded: {dc['loaded_options']}/{dc['total']} tickers ({pct:.0f}%)")
+        elif pct >= 50:
+            st.warning(f"Partial data: {dc['loaded_options']}/{dc['total']} tickers ({pct:.0f}%) — some tickers failed to load")
+        else:
+            st.error(f"Limited data: {dc['loaded_options']}/{dc['total']} tickers ({pct:.0f}%) — many fetches failed")
+
+    # --- Warnings from last refresh ---
+    warns = st.session_state.refresh_warnings
+    if warns:
+        with st.expander(f"Refresh warnings ({len(warns)}) — tap for details", expanded=False):
+            for w in warns[:50]:
+                st.text(w)
+            if len(warns) > 50:
+                st.text(f"... and {len(warns) - 50} more")
 
     # --- Tabs ---
     tab_csp, tab_cc, tab_vol, tab_detail = st.tabs([

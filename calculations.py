@@ -109,17 +109,33 @@ def compute_iv_percentile(current_iv: float, iv_history: pd.Series | None) -> fl
 # Premium Yield Metrics
 # ---------------------------------------------------------------------------
 
+def _safe_num(val, default=0):
+    """Convert a value to float, treating NaN as default."""
+    if val is None:
+        return default
+    try:
+        f = float(val)
+        return default if pd.isna(f) else f
+    except (ValueError, TypeError):
+        return default
+
+
 def compute_premium_metrics(row: pd.Series, option_type: str) -> dict:
     """
     Compute premium yield metrics for a single option contract.
-    row must have: bid, ask, strike, dte, stock_price
+    Falls back to lastPrice when bid/ask are zero or NaN (common after hours).
     """
-    bid = row.get("bid", 0) or 0
-    ask = row.get("ask", 0) or 0
+    bid = _safe_num(row.get("bid"))
+    ask = _safe_num(row.get("ask"))
     mid = (bid + ask) / 2 if (bid + ask) > 0 else 0
-    strike = row.get("strike", 0)
-    dte = row.get("dte", 1) or 1
-    stock_price = row.get("price", 0) or 0
+
+    # After hours, bid/ask are often 0 — fall back to lastPrice
+    if mid <= 0:
+        mid = _safe_num(row.get("lastPrice"))
+
+    strike = _safe_num(row.get("strike"))
+    dte = _safe_num(row.get("dte"), 1) or 1
+    stock_price = _safe_num(row.get("price"))
 
     if strike <= 0 or mid <= 0:
         return {"mid": 0, "raw_yield": 0, "ann_yield": 0, "net_yield": 0, "ann_net_yield": 0}
@@ -202,10 +218,10 @@ def compute_theta_efficiency(theta: float | None, option_price: float) -> float:
 # ---------------------------------------------------------------------------
 
 def compute_liquidity_metrics(row: pd.Series) -> dict:
-    bid = row.get("bid", 0) or 0
-    ask = row.get("ask", 0) or 0
-    mid = (bid + ask) / 2
-    spread = ask - bid
+    bid = _safe_num(row.get("bid"))
+    ask = _safe_num(row.get("ask"))
+    mid = (bid + ask) / 2 if (bid + ask) > 0 else _safe_num(row.get("lastPrice"))
+    spread = ask - bid if (bid > 0 and ask > 0) else 0
     spread_pct = (spread / mid * 100) if mid > 0 else 100
 
     vol = row.get("volume", 0)
@@ -409,13 +425,15 @@ def enrich_options(
     iv_history_cache: dict,
     sector_iv: dict,
     risk_free: float = 4.5,
-) -> pd.DataFrame:
+) -> tuple[pd.DataFrame, list[str]]:
     """
     Join options data with stock fundamentals, compute all metrics,
-    and score with PQS.
+    and score with PQS. Returns (enriched_df, warnings).
+    Per-row errors are caught and logged — good rows survive bad ones.
     """
+    warnings: list[str] = []
     if options_df.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(), ["enrich_options: input options_df is empty"]
 
     # Merge stock info
     merged = options_df.merge(
@@ -428,6 +446,7 @@ def enrich_options(
 
     rows = []
     for _, row in merged.iterrows():
+      try:
         ticker = row["ticker"]
         opt_type = row["option_type"]
 
@@ -555,18 +574,22 @@ def enrich_options(
         enriched["pqs_label"] = pqs_label(enriched["pqs"])
 
         rows.append(enriched)
+      except Exception as e:
+        warnings.append(f"{row.get('ticker','?')} {row.get('strike','?')} {row.get('option_type','?')}: {e}")
+        continue
 
     result = pd.DataFrame(rows)
+
+    if result.empty:
+        return result, warnings
 
     # Filter out obviously bad data
     result = result[result["mid"] > 0].copy()
     result = result[result["spread_pct"] < 50].copy()
 
     # Filter out deep ITM options that aren't practical trades
-    # For puts: strike should be at or below stock price (OTM puts)
-    # For calls: strike should be at or above stock price (OTM calls)
     puts_mask = (result["option_type"] == "put") & (result["strike"] <= result["price"] * 1.05)
     calls_mask = (result["option_type"] == "call") & (result["strike"] >= result["price"] * 0.95)
     result = result[puts_mask | calls_mask].copy()
 
-    return result
+    return result, warnings

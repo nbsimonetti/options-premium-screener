@@ -97,13 +97,15 @@ def build_universe() -> list[str]:
 # 2. Stock fundamentals (batch)
 # ---------------------------------------------------------------------------
 
-def fetch_stock_info(ticker: str) -> dict | None:
+def fetch_stock_info(ticker: str) -> tuple[dict | None, str | None]:
     """Fetch key fundamental data for a single ticker via yfinance.
-    Works both during market hours and after-hours."""
+    Returns (data_dict, warning_string). Warning is None on success."""
     try:
         t = yf.Ticker(ticker)
         info = t.info or {}
         price = _get_price_robust(t, info)
+        if not price or price <= 0:
+            return None, f"{ticker}: no valid price found"
         return {
             "ticker": ticker,
             "price": price,
@@ -119,9 +121,9 @@ def fetch_stock_info(ticker: str) -> dict | None:
             "short_pct_float": info.get("shortPercentOfFloat", 0) or 0,
             "source": "Yahoo Finance",
             "fetched_at": _now_str(),
-        }
-    except Exception:
-        return None
+        }, None
+    except Exception as e:
+        return None, f"{ticker}: {type(e).__name__}: {e}"
 
 
 def _safe_timestamp(val) -> str | None:
@@ -159,21 +161,30 @@ def _get_next_earnings(t: yf.Ticker) -> str | None:
 
 
 def fetch_all_stock_info(tickers: list[str], max_workers: int = 20,
-                          progress_callback=None) -> pd.DataFrame:
-    """Fetch fundamentals for all tickers in parallel."""
+                          progress_callback=None) -> tuple[pd.DataFrame, list[str]]:
+    """Fetch fundamentals for all tickers in parallel.
+    Returns (DataFrame, warnings_list)."""
     results = []
+    warnings = []
     total = len(tickers)
     done = 0
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = {pool.submit(fetch_stock_info, t): t for t in tickers}
         for f in as_completed(futures):
             done += 1
+            ticker = futures[f]
             if progress_callback:
-                progress_callback(done, total, futures[f])
-            res = f.result()
+                progress_callback(done, total, ticker)
+            try:
+                res, warn = f.result()
+            except Exception as e:
+                warnings.append(f"{ticker}: executor error: {e}")
+                continue
+            if warn:
+                warnings.append(warn)
             if res and res.get("price"):
                 results.append(res)
-    return pd.DataFrame(results)
+    return pd.DataFrame(results), warnings
 
 
 # ---------------------------------------------------------------------------
@@ -196,17 +207,13 @@ def fetch_historical_prices(ticker: str, period: str = "1y") -> pd.DataFrame | N
 # 4. Options chains
 # ---------------------------------------------------------------------------
 
-def fetch_options_chain(ticker: str, min_dte: int = 7, max_dte: int = 90) -> pd.DataFrame | None:
-    """
-    Fetch the full options chain for a ticker, filtered to expirations
-    within [min_dte, max_dte] days.
-    Returns a DataFrame with puts and calls combined.
-    """
+def fetch_options_chain(ticker: str, min_dte: int = 7, max_dte: int = 90) -> tuple[pd.DataFrame | None, str | None]:
+    """Fetch options chain for a ticker. Returns (DataFrame, warning)."""
     try:
         t = yf.Ticker(ticker)
-        expirations = t.options  # list of date strings
+        expirations = t.options
         if not expirations:
-            return None
+            return None, f"{ticker}: no options expirations available"
 
         today = dt.date.today()
         frames = []
@@ -232,30 +239,39 @@ def fetch_options_chain(ticker: str, min_dte: int = 7, max_dte: int = 90) -> pd.
                 frames.append(df)
 
         if not frames:
-            return None
-        return pd.concat(frames, ignore_index=True)
-    except Exception:
-        return None
+            return None, f"{ticker}: no chains in DTE range {min_dte}-{max_dte}"
+        return pd.concat(frames, ignore_index=True), None
+    except Exception as e:
+        return None, f"{ticker}: {type(e).__name__}: {e}"
 
 
 def fetch_all_options(tickers: list[str], min_dte: int = 7, max_dte: int = 90,
-                       max_workers: int = 10, progress_callback=None) -> pd.DataFrame:
-    """Fetch options chains for all tickers in parallel."""
+                       max_workers: int = 10, progress_callback=None) -> tuple[pd.DataFrame, list[str]]:
+    """Fetch options chains for all tickers in parallel.
+    Returns (DataFrame, warnings_list)."""
     results = []
+    warnings = []
     total = len(tickers)
     done = 0
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = {pool.submit(fetch_options_chain, t, min_dte, max_dte): t for t in tickers}
         for f in as_completed(futures):
             done += 1
+            ticker = futures[f]
             if progress_callback:
-                progress_callback(done, total, futures[f])
-            res = f.result()
+                progress_callback(done, total, ticker)
+            try:
+                res, warn = f.result()
+            except Exception as e:
+                warnings.append(f"{ticker}: executor error: {e}")
+                continue
+            if warn:
+                warnings.append(warn)
             if res is not None and not res.empty:
                 results.append(res)
     if not results:
-        return pd.DataFrame()
-    return pd.concat(results, ignore_index=True)
+        return pd.DataFrame(), warnings
+    return pd.concat(results, ignore_index=True), warnings
 
 
 # ---------------------------------------------------------------------------
