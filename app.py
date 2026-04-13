@@ -545,7 +545,7 @@ def style_pqs(val):
     return f"background-color: {color}; color: white; font-weight: bold"
 
 
-def render_table(df: pd.DataFrame, columns: list[str], top_n: int = 25):
+def render_table(df: pd.DataFrame, columns: list[str], top_n: int = 25, tab_id: str = ""):
     """Render a styled, sortable table optimized for mobile scroll."""
     if df.empty:
         st.info("No results match the current filters. Try adjusting your criteria.")
@@ -585,7 +585,7 @@ def render_table(df: pd.DataFrame, columns: list[str], top_n: int = 25):
 
     csv = display.to_csv(index=True)
     st.download_button("Export CSV", csv, "options_screen.csv", "text/csv",
-                       key=f"csv_{columns[0]}_{top_n}")
+                       key=f"csv_{tab_id}_{top_n}")
 
 
 # ---------------------------------------------------------------------------
@@ -820,14 +820,14 @@ def main():
         st.caption(f"Top cash-secured put ideas by PQS | Source: Yahoo Finance | {st.session_state.last_refresh or ''}")
         filters = render_filters(CSP_DEFAULTS, "csp")
         filtered = apply_filters(st.session_state.enriched_puts, filters)
-        render_table(filtered, DISPLAY_COLS_CSP, top_n=25)
+        render_table(filtered, DISPLAY_COLS_CSP, top_n=25, tab_id="csp")
 
     # --- Tab 2: Covered Calls ---
     with tab_cc:
         st.caption(f"Top covered call ideas by PQS | Source: Yahoo Finance | {st.session_state.last_refresh or ''}")
         filters = render_filters(CC_DEFAULTS, "cc")
         filtered = apply_filters(st.session_state.enriched_calls, filters)
-        render_table(filtered, DISPLAY_COLS_CC, top_n=25)
+        render_table(filtered, DISPLAY_COLS_CC, top_n=25, tab_id="cc")
 
     # --- Tab 3: Volatility Scanner ---
     with tab_vol:
