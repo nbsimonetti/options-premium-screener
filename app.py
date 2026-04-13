@@ -37,12 +37,18 @@ from data_fetcher import (
     fetch_risk_free_rates,
     fetch_sector_iv,
     estimate_iv_history,
+    is_market_open,
+    market_status_message,
 )
 from calculations import (
     compute_all_hv,
     enrich_options,
     pqs_color,
 )
+
+import json
+import pickle
+import hashlib
 
 # ---------------------------------------------------------------------------
 # Page config — no sidebar, wide layout
@@ -200,25 +206,75 @@ for key in ["data_loaded", "enriched_puts", "enriched_calls", "vol_scanner",
 if "refresh_running" not in st.session_state:
     st.session_state.refresh_running = False
 
+# ---------------------------------------------------------------------------
+# Disk cache — survives Render restarts and session reloads
+# ---------------------------------------------------------------------------
+_CACHE_DIR = os.path.join(os.path.dirname(__file__), ".cache")
+os.makedirs(_CACHE_DIR, exist_ok=True)
+_CACHE_FILE = os.path.join(_CACHE_DIR, "dashboard_data.pkl")
+
+
+def _save_cache(data: dict):
+    """Persist dashboard data to disk."""
+    try:
+        with open(_CACHE_FILE, "wb") as f:
+            pickle.dump(data, f)
+    except Exception:
+        pass
+
+
+def _load_cache() -> dict | None:
+    """Load cached dashboard data from disk."""
+    try:
+        if os.path.exists(_CACHE_FILE):
+            with open(_CACHE_FILE, "rb") as f:
+                data = pickle.load(f)
+            # Check staleness: reject cache older than 24 hours
+            cached_at = data.get("last_refresh", "")
+            if cached_at:
+                cached_time = dt.datetime.strptime(cached_at, "%Y-%m-%d %H:%M:%S")
+                if (dt.datetime.now() - cached_time).total_seconds() > 86400:
+                    return None  # stale
+            return data
+    except Exception:
+        pass
+    return None
+
+
+def _restore_from_cache() -> bool:
+    """Try to restore session state from disk cache. Returns True if successful."""
+    data = _load_cache()
+    if data is None:
+        return False
+    for key in ["enriched_puts", "enriched_calls", "vol_scanner",
+                "vix_data", "risk_free", "sector_iv", "stock_info", "last_refresh"]:
+        if key in data:
+            st.session_state[key] = data[key]
+    st.session_state.data_loaded = True
+    return True
+
 
 # ---------------------------------------------------------------------------
 # Data loading pipeline
 # ---------------------------------------------------------------------------
 
 def run_full_refresh():
-    """Execute the full data fetch and enrichment pipeline."""
+    """Execute the full data fetch and enrichment pipeline.
+    Works during market hours (live data) and after hours (last close data)."""
     st.session_state.refresh_running = True
 
     progress = st.progress(0, text="Starting data refresh...")
     status = st.empty()
 
+    mkt_open = is_market_open()
+    if not mkt_open:
+        status.info("Market is closed — fetching data as of most recent close...")
+
     # --- Step 1: Build universe ---
-    status.text("Building ticker universe...")
     progress.progress(2, text="Building ticker universe...")
     tickers = build_universe()
 
     # --- Step 2: Fetch VIX & risk-free rates & sector IV ---
-    status.text("Fetching market data (VIX, rates, sector IV)...")
     progress.progress(5, text="Fetching VIX, Treasury rates, sector IV...")
     vix_data = fetch_vix()
     risk_free_data = fetch_risk_free_rates()
@@ -235,7 +291,6 @@ def run_full_refresh():
         pct = 5 + int(done / total * 30)
         progress.progress(pct, text=f"Fetching stock info: {ticker} ({done}/{total})")
 
-    status.text("Fetching stock fundamentals...")
     stock_info = fetch_all_stock_info(tickers, max_workers=20, progress_callback=stock_progress)
     st.session_state.stock_info = stock_info
 
@@ -247,7 +302,6 @@ def run_full_refresh():
     valid_tickers = stock_info["ticker"].tolist()
 
     # --- Step 4: Fetch historical prices & compute HV ---
-    status.text("Computing historical volatility...")
     hv_cache = {}
     iv_history_cache = {}
     total_t = len(valid_tickers)
@@ -266,18 +320,16 @@ def run_full_refresh():
         pct = 55 + int(done / total * 35)
         progress.progress(pct, text=f"Fetching options: {ticker} ({done}/{total})")
 
-    status.text("Fetching options chains...")
     options_df = fetch_all_options(valid_tickers, min_dte=7, max_dte=90,
                                     max_workers=10, progress_callback=opts_progress)
 
     if options_df.empty:
-        st.error("No options data retrieved. The market may be closed or data unavailable.")
+        st.error("No options data retrieved. Try again in a few minutes.")
         st.session_state.refresh_running = False
         return
 
     # --- Step 6: Enrich & Score ---
     progress.progress(92, text="Calculating metrics & scoring...")
-    status.text("Enriching options data and computing PQS scores...")
 
     enriched = enrich_options(
         options_df, stock_info, hv_cache, iv_history_cache,
@@ -316,6 +368,18 @@ def run_full_refresh():
     st.session_state.last_refresh = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     st.session_state.data_loaded = True
     st.session_state.refresh_running = False
+
+    # Persist to disk so data survives Render cold starts
+    _save_cache({
+        "enriched_puts": st.session_state.enriched_puts,
+        "enriched_calls": st.session_state.enriched_calls,
+        "vol_scanner": st.session_state.vol_scanner,
+        "vix_data": st.session_state.vix_data,
+        "risk_free": st.session_state.risk_free,
+        "sector_iv": st.session_state.sector_iv,
+        "stock_info": st.session_state.stock_info,
+        "last_refresh": st.session_state.last_refresh,
+    })
 
     progress.progress(100, text="Done!")
     status.text("Refresh complete!")
@@ -684,7 +748,28 @@ def main():
     # --- Header ---
     st.markdown("## Options Premium Screener")
 
-    # Refresh button — prominent, full-width, at the top
+    # Market status banner
+    mkt_msg = market_status_message()
+    if is_market_open():
+        st.success(mkt_msg)
+    else:
+        st.warning(mkt_msg)
+
+    # Auto-load: restore from disk cache if session state is empty
+    if not st.session_state.data_loaded:
+        if _restore_from_cache():
+            pass  # Cache restored, proceed to show data
+        else:
+            # No cache exists — auto-trigger first refresh
+            st.info("Loading options data — this takes a few minutes on first visit...")
+            run_full_refresh()
+            if st.session_state.data_loaded:
+                st.rerun()
+            else:
+                st.error("Data load failed. Please try refreshing manually.")
+                return
+
+    # Refresh button
     if st.button(
         "Refresh All Data",
         type="primary",
@@ -724,41 +809,6 @@ def main():
             st.metric("1Y Rate", f"{rf['1yr']:.2f}%", help=f"Source: {rf.get('source','')}")
         else:
             st.metric("1Y Rate", "—")
-
-    # --- Pre-load state ---
-    if not st.session_state.data_loaded:
-        st.markdown("---")
-        st.info("Tap **Refresh All Data** above to load live options data. "
-                "Initial load takes a few minutes (~150 tickers).")
-
-        st.markdown("""
-### How it works
-1. **Refresh** pulls live options data from Yahoo Finance for S&P 500 + high-volume names
-2. Each contract is scored with a **Premium Quality Score (PQS)** from 0–100:
-
-| Weight | Factor |
-|--------|--------|
-| 20% | Annualized net yield |
-| 15% | IV Rank |
-| 15% | Volatility Risk Premium (IV − HV) |
-| 15% | Probability of Profit |
-| 10% | Breakeven distance |
-| 10% | Liquidity (bid-ask spread) |
-| 5% | Theta decay efficiency |
-| 10% | Fundamental safety |
-
-3. Top 25 ideas surface for **Cash-Secured Puts** and **Covered Calls**
-
-### Data Sources
-All data is publicly sourced with timestamps for traceability:
-- **Options chains, fundamentals, greeks** — Yahoo Finance (`yfinance`)
-- **Historical volatility** — Calculated from Yahoo Finance daily closes
-- **IV Rank / IV Percentile** — Derived from 1-year HV proxy
-- **VIX / Market regime** — CBOE VIX via Yahoo Finance
-- **Risk-free rate** — FRED / Yahoo Finance Treasury proxies
-- **Sector IV** — Yahoo Finance sector ETF options (XLK, XLF, XLE, etc.)
-        """)
-        return
 
     # --- Tabs ---
     tab_csp, tab_cc, tab_vol, tab_detail = st.tabs([

@@ -1,6 +1,7 @@
 """
 Data sourcing layer for the Options Premium Screener Dashboard.
 All fetches are timestamped and attributed to their public source.
+Works both during market hours and after-hours using last-close data.
 """
 
 import datetime as dt
@@ -9,6 +10,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import pandas as pd
+import pytz
 import requests
 import yfinance as yf
 
@@ -21,9 +23,63 @@ from config import (
     get_sp500_tickers,
 )
 
+# US Eastern timezone for market hours
+_ET = pytz.timezone("US/Eastern")
+
 
 def _now_str() -> str:
     return dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+# ---------------------------------------------------------------------------
+# Market hours detection
+# ---------------------------------------------------------------------------
+
+def is_market_open() -> bool:
+    """Check if US equity markets are currently open (9:30-16:00 ET, weekdays)."""
+    now_et = dt.datetime.now(_ET)
+    if now_et.weekday() >= 5:  # Saturday=5, Sunday=6
+        return False
+    market_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+    market_close = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
+    return market_open <= now_et <= market_close
+
+
+def market_status_message() -> str:
+    """Return a human-readable market status string."""
+    if is_market_open():
+        return "Market OPEN — showing live data"
+    now_et = dt.datetime.now(_ET)
+    return f"Market CLOSED ({now_et.strftime('%a %I:%M %p ET')}) — showing data as of last close"
+
+
+def _get_price_robust(ticker_obj: yf.Ticker, info: dict) -> float | None:
+    """
+    Robust price extraction that works both during and after market hours.
+    Tries multiple fields and falls back to the last historical close.
+    """
+    # Try live/recent price fields in order of preference
+    for field in [
+        "currentPrice",
+        "regularMarketPrice",
+        "previousClose",
+        "regularMarketPreviousClose",
+        "open",
+        "regularMarketOpen",
+    ]:
+        val = info.get(field)
+        if val and val > 0:
+            return float(val)
+
+    # Final fallback: last close from price history
+    try:
+        hist = ticker_obj.history(period="5d", auto_adjust=True)
+        if not hist.empty:
+            return float(hist["Close"].iloc[-1])
+    except Exception:
+        pass
+
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -42,13 +98,15 @@ def build_universe() -> list[str]:
 # ---------------------------------------------------------------------------
 
 def fetch_stock_info(ticker: str) -> dict | None:
-    """Fetch key fundamental data for a single ticker via yfinance."""
+    """Fetch key fundamental data for a single ticker via yfinance.
+    Works both during market hours and after-hours."""
     try:
         t = yf.Ticker(ticker)
         info = t.info or {}
+        price = _get_price_robust(t, info)
         return {
             "ticker": ticker,
-            "price": info.get("currentPrice") or info.get("regularMarketPrice") or info.get("previousClose"),
+            "price": price,
             "market_cap": info.get("marketCap"),
             "pe_ratio": info.get("trailingPE"),
             "sector": info.get("sector", "Unknown"),
@@ -299,7 +357,7 @@ def fetch_sector_iv() -> dict:
             chain = t.option_chain(target_exp)
             calls = chain.calls
             info = t.info or {}
-            price = info.get("currentPrice") or info.get("regularMarketPrice") or info.get("previousClose")
+            price = _get_price_robust(t, info)
             if price and not calls.empty:
                 calls["dist"] = abs(calls["strike"] - price)
                 atm = calls.loc[calls["dist"].idxmin()]
