@@ -7,6 +7,12 @@ ranked by a composite Premium Quality Score (PQS).
 
 Launch locally:   streamlit run app.py
 Deploy:           Push to GitHub -> connect on share.streamlit.io
+
+Widget key naming convention (all keys must be globally unique):
+  Filters:      {tab}_dte, {tab}_delta, {tab}_ivrank, {tab}_yield, {tab}_pop,
+                {tab}_earn, {tab}_sectors, {tab}_cap  (tab = csp | cc)
+  CSV export:   csv_{tab}_25, csv_vol_scanner
+  Trade detail: detail_strategy_radio, {detail_key}_ticker_select
 """
 
 import datetime as dt
@@ -391,7 +397,8 @@ def run_full_refresh():
 
 def render_filters(defaults: dict, key_prefix: str) -> dict:
     """Render filter controls inside a collapsible expander."""
-    with st.expander("Filters — tap to adjust", expanded=False):
+    label = "Put Filters — tap to adjust" if key_prefix == "csp" else "Call Filters — tap to adjust"
+    with st.expander(label, expanded=False):
         # Row 1: DTE and Delta
         c1, c2 = st.columns(2)
         with c1:
@@ -600,13 +607,14 @@ def _metric_card(label: str, value: str, color: str = "#1a1a1a") -> str:
     </div>"""
 
 
-def render_trade_detail(df: pd.DataFrame):
+def render_trade_detail(df: pd.DataFrame, detail_key: str = "detail"):
     """Render a detailed view for a selected ticker — mobile-friendly cards."""
     if df is None or df.empty:
         return
 
     tickers = sorted(df["ticker"].unique())
-    selected = st.selectbox("Select ticker for detail view", tickers)
+    selected = st.selectbox("Select ticker for detail view", tickers,
+                            key=f"{detail_key}_ticker_select")
 
     ticker_data = df[df["ticker"] == selected].sort_values("pqs", ascending=False)
     if ticker_data.empty:
@@ -737,7 +745,8 @@ def render_vol_scanner(vol_df: pd.DataFrame):
     )
 
     csv = display.to_csv(index=True)
-    st.download_button("Export Vol Scanner CSV", csv, "vol_scanner.csv", "text/csv")
+    st.download_button("Export Vol Scanner CSV", csv, "vol_scanner.csv", "text/csv",
+                       key="csv_vol_scanner")
 
 
 # ============================================================================
@@ -837,11 +846,12 @@ def main():
     # --- Tab 4: Trade Detail ---
     with tab_detail:
         st.caption("Drill into a ticker for payoff diagrams, greeks, and alternative strikes")
-        detail_type = st.radio("Strategy", ["Cash-Secured Put", "Covered Call"], horizontal=True)
+        detail_type = st.radio("Strategy", ["Cash-Secured Put", "Covered Call"],
+                               horizontal=True, key="detail_strategy_radio")
         if detail_type == "Cash-Secured Put":
-            render_trade_detail(st.session_state.enriched_puts)
+            render_trade_detail(st.session_state.enriched_puts, detail_key="detail_put")
         else:
-            render_trade_detail(st.session_state.enriched_calls)
+            render_trade_detail(st.session_state.enriched_calls, detail_key="detail_call")
 
     # --- Footer ---
     st.markdown("---")
