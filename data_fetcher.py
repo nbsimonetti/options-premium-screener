@@ -23,12 +23,14 @@ from config import (
     get_sp500_tickers,
 )
 
-# US Eastern timezone for market hours
+# Central Time for display, Eastern for market hours check
+_CT = pytz.timezone("US/Central")
 _ET = pytz.timezone("US/Eastern")
 
 
 def _now_str() -> str:
-    return dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    """Current time in Central Time."""
+    return dt.datetime.now(_CT).strftime("%Y-%m-%d %H:%M:%S CT")
 
 
 # ---------------------------------------------------------------------------
@@ -38,7 +40,7 @@ def _now_str() -> str:
 def is_market_open() -> bool:
     """Check if US equity markets are currently open (9:30-16:00 ET, weekdays)."""
     now_et = dt.datetime.now(_ET)
-    if now_et.weekday() >= 5:  # Saturday=5, Sunday=6
+    if now_et.weekday() >= 5:
         return False
     market_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
     market_close = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
@@ -46,11 +48,11 @@ def is_market_open() -> bool:
 
 
 def market_status_message() -> str:
-    """Return a human-readable market status string."""
+    """Return a human-readable market status string in Central Time."""
+    now_ct = dt.datetime.now(_CT)
     if is_market_open():
-        return "Market OPEN — showing live data"
-    now_et = dt.datetime.now(_ET)
-    return f"Market CLOSED ({now_et.strftime('%a %I:%M %p ET')}) — showing data as of last close"
+        return f"Market OPEN ({now_ct.strftime('%I:%M %p CT')}) — showing live data"
+    return f"Market CLOSED ({now_ct.strftime('%a %I:%M %p CT')}) — showing data as of last close"
 
 
 def _get_price_robust(ticker_obj: yf.Ticker, info: dict) -> float | None:
@@ -188,11 +190,36 @@ def fetch_all_stock_info(tickers: list[str], max_workers: int = 20,
 
 
 # ---------------------------------------------------------------------------
-# 3. Historical prices (for HV calculation)
+# 3. Historical prices (batch download for speed)
 # ---------------------------------------------------------------------------
 
+def fetch_historical_prices_batch(tickers: list[str], period: str = "1y") -> dict[str, pd.DataFrame]:
+    """Batch-download daily close prices for all tickers at once.
+    Returns {ticker: DataFrame with Close column}. Much faster than per-ticker calls."""
+    try:
+        data = yf.download(tickers, period=period, auto_adjust=True,
+                           threads=True, progress=False)
+        if data.empty:
+            return {}
+        result = {}
+        if len(tickers) == 1:
+            if "Close" in data.columns:
+                result[tickers[0]] = data[["Close"]].dropna()
+        else:
+            for ticker in tickers:
+                try:
+                    close = data["Close"][ticker].dropna()
+                    if not close.empty:
+                        result[ticker] = close.to_frame("Close")
+                except (KeyError, TypeError):
+                    continue
+        return result
+    except Exception:
+        return {}
+
+
 def fetch_historical_prices(ticker: str, period: str = "1y") -> pd.DataFrame | None:
-    """Fetch daily close prices for HV calculation."""
+    """Fetch daily close prices for a single ticker (fallback)."""
     try:
         t = yf.Ticker(ticker)
         hist = t.history(period=period, auto_adjust=True)
